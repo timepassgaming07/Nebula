@@ -3,3 +3,8 @@ node_modules/
 *.log
 KEYS.txt
 *.json.bak
+# Local envs and secrets
+frontend/.env*
+secrets/
+google-play-key.json
+*.keystore
