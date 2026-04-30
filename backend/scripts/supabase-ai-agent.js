@@ -1,104 +1,241 @@
 #!/usr/bin/env node
 
-/*
- * Supabase AI Question Refill Agent
+/**
+ * ====================================================
+ * Nebula AI Question Refill Agent (Multi-Provider)
+ * ====================================================
  *
- * Monitors per-category unplayed inventory and auto-generates batches when
+ * Monitors per-category unplayed inventory and auto-generates
+ * high-volume question batches (30-50 questions per API call) when
  * unplayed active questions drop below threshold.
+ *
+ * Provider Strategy (Fallback Chain):
+ * 1. PRIMARY: Groq SDK (llama3-70b-8192, mixtral-8x7b-32768) - ultra-fast & cheap
+ * 2. FALLBACK 1: OpenAI (gpt-4o-mini) - if Groq fails
+ * 3. FALLBACK 2: Gemini (gemini-1.5-flash) - if both Groq and OpenAI fail
+ *
+ * Primary Features:
+ * - Groq as primary: 10-15s cooldown between batches, aggressive batching
+ * - Smart rate-limiting: 429 Exponential Backoff, per-provider delay
+ * - High-volume batching: Single API call for 30-50 questions
+ * - Bulk Supabase insert to minimize database connections
+ * - Automatic provider fallback on repeated failures
+ *
+ * Environment:
+ *   GROQ_API_KEY              - Groq API key (optional, but primary)
+ *   GROQ_MODEL                - Model (default: llama3-70b-8192)
+ *   OPENAI_API_KEY            - OpenAI API key (optional, fallback 1)
+ *   OPENAI_MODEL              - Model (default: gpt-4o-mini)
+ *   GEMINI_API_KEY            - Gemini API key (optional, fallback 2)
+ *   GEMINI_MODEL              - Model (default: gemini-1.5-flash)
+ *   SUPABASE_URL              - Supabase project URL (required)
+ *   SUPABASE_SERVICE_ROLE_KEY - Service role key (required)
+ *   AI_THRESHOLD              - Refill threshold (default: 500 unplayed questions)
+ *   AI_BATCH_SIZE             - Questions per batch (default: 40)
+ *   AI_COOLDOWN_MS            - Delay between batches (default: 12000ms = 12s)
+ *   AI_POLL_INTERVAL_MS       - Polling interval (default: 300000ms = 5min)
+ *   AI_RUN_ONCE               - Run once and exit (default: false)
  */
 
 const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
+const Groq = require('groq-sdk');
+
+// ========== CONFIG & VALIDATION ==========
 
 const {
-  SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY,
+  GROQ_API_KEY,
+  GROQ_MODEL = 'llama3-70b-8192',
   OPENAI_API_KEY,
   OPENAI_MODEL = 'gpt-4o-mini',
   GEMINI_API_KEY,
   GEMINI_MODEL = 'gemini-1.5-flash',
-  AI_PROVIDER = OPENAI_API_KEY ? 'openai' : 'gemini',
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY,
   AI_THRESHOLD = '500',
-  AI_BATCH_SIZE = '50',
+  AI_BATCH_SIZE = '40',
+  AI_COOLDOWN_MS = '12000',
   AI_POLL_INTERVAL_MS = '300000',
   AI_RUN_ONCE = 'false',
 } = process.env;
 
+// Validate required environment variables
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
-}
-if (AI_PROVIDER === 'openai' && !OPENAI_API_KEY) {
-  throw new Error('AI_PROVIDER=openai but OPENAI_API_KEY is missing');
-}
-if (AI_PROVIDER === 'gemini' && !GEMINI_API_KEY) {
-  throw new Error('AI_PROVIDER=gemini but GEMINI_API_KEY is missing');
+  throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required');
 }
 
+// Check that at least one AI provider is configured
+if (!GROQ_API_KEY && !OPENAI_API_KEY && !GEMINI_API_KEY) {
+  throw new Error('At least one AI provider key must be set: GROQ_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY');
+}
+
+// Parse numeric config
 const THRESHOLD = Number.parseInt(AI_THRESHOLD, 10);
 const BATCH_SIZE = Number.parseInt(AI_BATCH_SIZE, 10);
+const COOLDOWN_MS = Number.parseInt(AI_COOLDOWN_MS, 10);
 const POLL_INTERVAL_MS = Number.parseInt(AI_POLL_INTERVAL_MS, 10);
 const RUN_ONCE = AI_RUN_ONCE === 'true';
+
+// Validate parsed values
+if (!Number.isFinite(THRESHOLD) || THRESHOLD <= 0) {
+  throw new Error('AI_THRESHOLD must be a positive integer');
+}
+if (!Number.isFinite(BATCH_SIZE) || BATCH_SIZE < 1 || BATCH_SIZE > 100) {
+  throw new Error('AI_BATCH_SIZE must be between 1 and 100');
+}
+if (!Number.isFinite(COOLDOWN_MS) || COOLDOWN_MS < 0) {
+  throw new Error('AI_COOLDOWN_MS must be a non-negative integer');
+}
+
+// ========== CLIENTS ==========
+
+const groq = new Groq({ apiKey: GROQ_API_KEY });
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
 });
 
+// ========== LOGGING UTILITIES ==========
+
 function log(msg, extra) {
+  const timestamp = new Date().toISOString();
   if (extra !== undefined) {
-    console.log(`[ai-agent] ${msg}`, extra);
+    console.log(`[${timestamp}] [ai-agent] ${msg}`, extra);
     return;
   }
-  console.log(`[ai-agent] ${msg}`);
+  console.log(`[${timestamp}] [ai-agent] ${msg}`);
+}
+
+function warn(msg, extra) {
+  const timestamp = new Date().toISOString();
+  if (extra !== undefined) {
+    console.warn(`[${timestamp}] [ai-agent] WARNING: ${msg}`, extra);
+    return;
+  }
+  console.warn(`[${timestamp}] [ai-agent] WARNING: ${msg}`);
 }
 
 function fail(msg, extra) {
+  const timestamp = new Date().toISOString();
   if (extra !== undefined) {
-    console.error(`[ai-agent] ${msg}`, extra);
+    console.error(`[${timestamp}] [ai-agent] ERROR: ${msg}`, extra);
     return;
   }
-  console.error(`[ai-agent] ${msg}`);
+  console.error(`[${timestamp}] [ai-agent] ERROR: ${msg}`);
 }
 
-function parseJsonLoose(rawText) {
+// ========== JSON PARSING ==========
+
+/**
+ * Attempts to extract and parse JSON from model response.
+ * Handles multiple formats: raw JSON, fenced JSON, partial JSON.
+ */
+function parseJsonResponse(rawText) {
+  if (!rawText || typeof rawText !== 'string') {
+    throw new Error('Response must be a non-empty string');
+  }
+
   const trimmed = rawText.trim();
 
+  // Try direct JSON parse
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-    return JSON.parse(trimmed);
+    try {
+      return JSON.parse(trimmed);
+    } catch (e) {
+      // Fall through to other strategies
+    }
   }
 
+  // Try markdown-fenced JSON
   const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fenced && fenced[1]) {
-    return JSON.parse(fenced[1].trim());
+    try {
+      return JSON.parse(fenced[1].trim());
+    } catch (e) {
+      // Fall through
+    }
   }
 
+  // Try extracting first {...} or [...]
   const firstBrace = trimmed.indexOf('{');
   const lastBrace = trimmed.lastIndexOf('}');
   if (firstBrace >= 0 && lastBrace > firstBrace) {
-    return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+    try {
+      return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+    } catch (e) {
+      // Fall through
+    }
   }
 
-  throw new Error('Unable to parse JSON response from model');
+  // Last resort: try extracting first [...]
+  const firstBracket = trimmed.indexOf('[');
+  const lastBracket = trimmed.lastIndexOf(']');
+  if (firstBracket >= 0 && lastBracket > firstBracket) {
+    try {
+      return JSON.parse(trimmed.slice(firstBracket, lastBracket + 1));
+    } catch (e) {
+      // Fall through
+    }
+  }
+
+  throw new Error('Unable to extract valid JSON from model response');
 }
 
-function validateQuestions(payload) {
-  if (!payload || !Array.isArray(payload.items)) {
-    throw new Error('Model response must be JSON object with items[]');
+// ========== VALIDATION ==========
+
+/**
+ * Validates and normalizes a batch of questions from model output.
+ * Enforces strict constraints on all fields.
+ */
+function validateQuestionBatch(payload) {
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('Model response must be a JSON object');
   }
 
-  const normalized = payload.items.map((q) => {
-    const question_text = String(q.question_text || '').trim();
-    const correct_answer = String(q.correct_answer || '').trim();
-    const explanation = q.explanation ? String(q.explanation).trim() : null;
-    const difficulty = Number.parseInt(String(q.difficulty ?? 3), 10);
+  // Accept both "items" and "questions" keys for flexibility
+  const items = payload.items || payload.questions;
+  if (!Array.isArray(items)) {
+    throw new Error(`Model response must contain 'items' or 'questions' array. Got: ${typeof items}`);
+  }
 
-    if (question_text.length < 10 || question_text.length > 500) {
-      throw new Error(`Invalid question_text length: ${question_text.length}`);
+  // Validate batch size
+  if (items.length < 1) {
+    throw new Error('Batch must contain at least 1 question');
+  }
+  if (items.length > BATCH_SIZE) {
+    throw new Error(`Batch contains ${items.length} questions, expected <= ${BATCH_SIZE}`);
+  }
+
+  // Normalize and validate each question
+  const normalized = items.map((q, index) => {
+    if (!q || typeof q !== 'object') {
+      throw new Error(`Question ${index} is not a valid object`);
     }
-    if (correct_answer.length < 1 || correct_answer.length > 200) {
-      throw new Error(`Invalid correct_answer length: ${correct_answer.length}`);
+
+    const question_text = String(q.question_text || q.question || '').trim();
+    const correct_answer = String(q.correct_answer || q.answer || '').trim();
+    const explanation = q.explanation ? String(q.explanation).trim() : null;
+    const difficulty = q.difficulty ? Number.parseInt(String(q.difficulty), 10) : 3;
+
+    // Validate question_text
+    if (question_text.length < 10) {
+      throw new Error(`Question ${index}: text too short (min 10 chars)`);
     }
+    if (question_text.length > 500) {
+      throw new Error(`Question ${index}: text too long (max 500 chars, got ${question_text.length})`);
+    }
+
+    // Validate correct_answer
+    if (correct_answer.length < 1) {
+      throw new Error(`Question ${index}: answer cannot be empty`);
+    }
+    if (correct_answer.length > 200) {
+      throw new Error(`Question ${index}: answer too long (max 200 chars, got ${correct_answer.length})`);
+    }
+
+    // Validate difficulty
     if (!Number.isInteger(difficulty) || difficulty < 1 || difficulty > 5) {
-      throw new Error(`Invalid difficulty: ${difficulty}`);
+      throw new Error(`Question ${index}: difficulty must be 1-5, got ${difficulty}`);
     }
 
     return {
@@ -109,14 +246,87 @@ function validateQuestions(payload) {
     };
   });
 
-  if (normalized.length !== BATCH_SIZE) {
-    throw new Error(`Expected exactly ${BATCH_SIZE} questions, got ${normalized.length}`);
-  }
-
   return normalized;
 }
 
-async function generateWithOpenAI(categoryName) {
+// ========== GROQ API INTEGRATION ==========
+
+/**
+ * Generates a batch of trivia questions using Groq.
+ * Returns null if Groq is not configured or fails with retries exhausted.
+ */
+async function generateQuestionsWithGroq(categoryName) {
+  if (!GROQ_API_KEY) {
+    return null; // Groq not configured, skip to fallback
+  }
+
+  const systemPrompt = `You are a professional trivia question generator for a multiplayer party game.
+Your task is to generate a batch of ${BATCH_SIZE} trivia questions for the category: ${categoryName}.
+
+CRITICAL INSTRUCTIONS:
+1. Generate EXACTLY ${BATCH_SIZE} questions in a single JSON response.
+2. Each question must have unique content (no duplicates or paraphrases).
+3. Questions must be challenging but fair - suitable for knowledgeable players.
+4. Return STRICT JSON ONLY. No markdown, no commentary, no code blocks.
+5. Use this exact JSON structure:
+{
+  "items": [
+    {
+      "question_text": "Clear, engaging question without answer hints?",
+      "correct_answer": "Short, concise answer",
+      "explanation": "Brief fact or reasoning (optional)",
+      "difficulty": 3
+    }
+  ]
+}`;
+
+  const userPrompt = `Generate ${BATCH_SIZE} trivia questions for: ${categoryName}`;
+
+  log(`Requesting ${BATCH_SIZE} questions from Groq (model: ${GROQ_MODEL}, category: ${categoryName})`);
+
+  try {
+    const response = await groq.chat.completions.create({
+      model: GROQ_MODEL,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      temperature: 0.8,
+      max_tokens: 8000,
+    });
+
+    const content = response?.choices?.[0]?.message?.content;
+    if (!content) {
+      throw new Error('Groq returned empty response');
+    }
+
+    log(`Received response from Groq (${content.length} chars)`);
+
+    const parsed = parseJsonResponse(content);
+    const normalized = validateQuestionBatch(parsed);
+
+    log(`✓ Groq: Validated ${normalized.length} questions for ${categoryName}`);
+    return normalized;
+  } catch (error) {
+    if (error.status === 429) {
+      warn(`Groq rate limit (429): ${error.message}`);
+      throw new RateLimitError(`Groq 429: ${error.message}`, 429);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Generates questions using OpenAI as fallback.
+ * Returns null if OpenAI is not configured.
+ */
+async function generateQuestionsWithOpenAI(categoryName) {
+  if (!OPENAI_API_KEY) {
+    return null;
+  }
+
+  log(`Requesting ${BATCH_SIZE} questions from OpenAI (model: ${OPENAI_MODEL}, category: ${categoryName})`);
+
   const schema = {
     type: 'object',
     additionalProperties: false,
@@ -124,7 +334,7 @@ async function generateWithOpenAI(categoryName) {
     properties: {
       items: {
         type: 'array',
-        minItems: BATCH_SIZE,
+        minItems: Math.max(1, Math.floor(BATCH_SIZE * 0.8)),
         maxItems: BATCH_SIZE,
         items: {
           type: 'object',
@@ -144,54 +354,75 @@ async function generateWithOpenAI(categoryName) {
   const prompt = [
     'Generate multiplayer trivia questions in strict JSON.',
     `Category: ${categoryName}`,
-    `Count: ${BATCH_SIZE}`,
+    `Target count: ${BATCH_SIZE}`,
     'Keep correct_answer concise and objective.',
     'Avoid duplicate topics or nearly identical phrasings.',
     'No markdown, no commentary, JSON only.',
   ].join('\n');
 
-  const res = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      temperature: 0.7,
-      response_format: {
-        type: 'json_schema',
-        json_schema: {
-          name: 'trivia_batch',
-          strict: true,
-          schema,
-        },
+  try {
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
       },
-      messages: [
-        { role: 'system', content: 'You output strict JSON only.' },
-        { role: 'user', content: prompt },
-      ],
-    }),
-  });
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        temperature: 0.7,
+        response_format: {
+          type: 'json_schema',
+          json_schema: {
+            name: 'trivia_batch',
+            strict: true,
+            schema,
+          },
+        },
+        messages: [
+          { role: 'system', content: 'You output strict JSON only.' },
+          { role: 'user', content: prompt },
+        ],
+      }),
+    });
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`OpenAI error ${res.status}: ${text}`);
+    if (!res.ok) {
+      const text = await res.text();
+      if (res.status === 429) {
+        throw new RateLimitError(`OpenAI 429: ${text}`, 429);
+      }
+      throw new Error(`OpenAI error ${res.status}: ${text}`);
+    }
+
+    const body = await res.json();
+    const content = body?.choices?.[0]?.message?.content;
+    if (!content) {
+      throw new Error('OpenAI returned empty content');
+    }
+
+    const parsed = JSON.parse(content);
+    const normalized = validateQuestionBatch(parsed);
+
+    log(`✓ OpenAI: Validated ${normalized.length} questions for ${categoryName}`);
+    return normalized;
+  } catch (error) {
+    throw error;
   }
-
-  const body = await res.json();
-  const content = body?.choices?.[0]?.message?.content;
-  if (!content) {
-    throw new Error('OpenAI returned empty content');
-  }
-
-  return validateQuestions(JSON.parse(content));
 }
 
-async function generateWithGemini(categoryName) {
+/**
+ * Generates questions using Gemini as final fallback.
+ * Returns null if Gemini is not configured.
+ */
+async function generateQuestionsWithGemini(categoryName) {
+  if (!GEMINI_API_KEY) {
+    return null;
+  }
+
+  log(`Requesting ${BATCH_SIZE} questions from Gemini (model: ${GEMINI_MODEL}, category: ${categoryName})`);
+
   const prompt = [
     'Return only valid JSON.',
-    `Generate exactly ${BATCH_SIZE} multiplayer trivia questions for category: ${categoryName}.`,
+    `Generate at least 1 and up to ${BATCH_SIZE} multiplayer trivia questions for category: ${categoryName}.`,
     'Use this JSON shape exactly:',
     '{"items":[{"question_text":"...","correct_answer":"...","explanation":"...","difficulty":3}]}',
     'Constraints:',
@@ -206,33 +437,106 @@ async function generateWithGemini(categoryName) {
     GEMINI_MODEL
   )}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.7,
-        responseMimeType: 'application/json',
-      },
-    }),
-  });
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.7,
+          responseMimeType: 'application/json',
+        },
+      }),
+    });
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Gemini error ${res.status}: ${text}`);
+    if (!res.ok) {
+      const text = await res.text();
+      if (res.status === 429) {
+        throw new RateLimitError(`Gemini 429: ${text}`, 429);
+      }
+      throw new Error(`Gemini error ${res.status}: ${text}`);
+    }
+
+    const body = await res.json();
+    const text = body?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) {
+      throw new Error('Gemini returned empty content');
+    }
+
+    const parsed = parseJsonResponse(text);
+    const normalized = validateQuestionBatch(parsed);
+
+    log(`✓ Gemini: Validated ${normalized.length} questions for ${categoryName}`);
+    return normalized;
+  } catch (error) {
+    throw error;
   }
-
-  const body = await res.json();
-  const text = body?.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) {
-    throw new Error('Gemini returned empty content');
-  }
-
-  const parsed = parseJsonLoose(text);
-  return validateQuestions(parsed);
 }
 
+// ========== PROVIDER FALLBACK CHAIN ==========
+
+/**
+ * Tries all configured providers in order: Groq → OpenAI → Gemini
+ * If a provider fails with a rate limit, it will be retried by withBackoff().
+ * Only advances to next provider on non-rate-limit errors.
+ */
+async function generateQuestionsWithFallback(categoryName) {
+  const errors = [];
+
+  // Try Groq first (primary)
+  try {
+    const result = await generateQuestionsWithGroq(categoryName);
+    if (result) return result;
+  } catch (error) {
+    // If it's a rate limit, throw immediately (let withBackoff handle retry)
+    if (error instanceof RateLimitError) {
+      throw error;
+    }
+    // Otherwise, log and try next provider
+    errors.push(`Groq: ${error.message}`);
+    warn(`Groq failed, trying OpenAI fallback: ${error.message}`);
+  }
+
+  // Try OpenAI (fallback 1)
+  try {
+    const result = await generateQuestionsWithOpenAI(categoryName);
+    if (result) return result;
+  } catch (error) {
+    if (error instanceof RateLimitError) {
+      throw error;
+    }
+    errors.push(`OpenAI: ${error.message}`);
+    warn(`OpenAI failed, trying Gemini fallback: ${error.message}`);
+  }
+
+  // Try Gemini (fallback 2)
+  try {
+    const result = await generateQuestionsWithGemini(categoryName);
+    if (result) return result;
+  } catch (error) {
+    if (error instanceof RateLimitError) {
+      throw error;
+    }
+    errors.push(`Gemini: ${error.message}`);
+  }
+
+  // All providers exhausted
+  throw new Error(
+    `All AI providers failed for ${categoryName}:\n${errors.map((e) => `  - ${e}`).join('\n')}`
+  );
+}
+
+// ========== BACKOFF WITH 429 HANDLING ==========
+
+/**
+ * Retries an operation with exponential backoff.
+ * Special handling for 429 errors: uses longer, more aggressive backoff.
+ *
+ * Backoff strategy:
+ * - Standard errors: 1s, 2s, 4s, 8s, 16s, 30s (with jitter)
+ * - 429 errors: 10s, 20s, 40s, 80s, ... (longer waiting)
+ */
 async function withBackoff(fn, options = {}) {
   const {
     retries = 6,
@@ -245,26 +549,48 @@ async function withBackoff(fn, options = {}) {
     try {
       return await fn();
     } catch (error) {
-      if (attempt >= retries) throw error;
-      const jitter = Math.floor(Math.random() * 1000);
-      const waitMs = Math.min(maxMs, baseMs * (2 ** attempt)) + jitter;
-      fail(`${label} failed (attempt ${attempt + 1}/${retries + 1}): ${error.message}`);
-      await new Promise((resolve) => setTimeout(resolve, waitMs));
+      // If we've exhausted retries, throw the error
+      if (attempt >= retries) {
+        fail(`${label} failed after ${retries + 1} attempts: ${error.message}`);
+        throw error;
+      }
+
+      // Determine wait time based on error type
+      let waitMs;
+      if (error instanceof RateLimitError && error.statusCode === 429) {
+        // For 429: Use longer, more aggressive backoff (10s, 20s, 40s, ...)
+        const jitter = Math.floor(Math.random() * 2000);
+        waitMs = Math.min(maxMs, 10000 * (2 ** attempt)) + jitter;
+        warn(
+          `${label} hit rate limit (attempt ${attempt + 1}/${retries + 1}). ` +
+          `Waiting ${waitMs}ms before retry...`
+        );
+      } else {
+        // For other errors: Standard exponential backoff
+        const jitter = Math.floor(Math.random() * 1000);
+        waitMs = Math.min(maxMs, baseMs * (2 ** attempt)) + jitter;
+        warn(`${label} failed (attempt ${attempt + 1}/${retries + 1}): ${error.message}. ` +
+          `Retrying in ${waitMs}ms...`);
+      }
+
+      // Wait before retry
+      await sleep(waitMs);
     }
   }
 }
 
-async function generateBatch(categoryName) {
-  if (AI_PROVIDER === 'gemini') {
-    return withBackoff(() => generateWithGemini(categoryName), {
-      label: `gemini:${categoryName}`,
-    });
-  }
-  return withBackoff(() => generateWithOpenAI(categoryName), {
-    label: `openai:${categoryName}`,
-  });
+/**
+ * Sleep helper for cleaner async/await code.
+ */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// ========== SUPABASE OPERATIONS ==========
+
+/**
+ * Query unplayed question count for a category.
+ */
 async function getUnplayedCount(categoryId) {
   const { count, error } = await supabase
     .from('questions')
@@ -274,15 +600,20 @@ async function getUnplayedCount(categoryId) {
     .eq('times_served', 0);
 
   if (error) {
-    throw error;
+    throw new Error(`Failed to count unplayed questions: ${error.message}`);
   }
 
   return count || 0;
 }
 
-async function insertBatch(categoryId, categoryName, items) {
+/**
+ * Bulk insert questions into Supabase.
+ * Uses upsert to handle potential duplicates gracefully.
+ */
+async function insertQuestionBatch(categoryId, categoryName, items, sourceModel) {
   const batchId = crypto.randomUUID();
 
+  // Transform items into database row format
   const rows = items.map((q) => ({
     category_id: categoryId,
     question_text: q.question_text,
@@ -292,61 +623,128 @@ async function insertBatch(categoryId, categoryName, items) {
     language_code: 'en',
     is_active: true,
     generation_batch_id: batchId,
-    source_model: AI_PROVIDER === 'gemini' ? GEMINI_MODEL : OPENAI_MODEL,
+    source_model: sourceModel || GROQ_MODEL,
     created_by: 'ai_agent',
+    // Note: question_hash is computed by database trigger
   }));
 
-  const { error } = await supabase
+  log(`Bulk inserting ${rows.length} questions for ${categoryName} (batchId: ${batchId}, model: ${sourceModel || GROQ_MODEL})`);
+
+  const { data, error } = await supabase
     .from('questions')
-    .upsert(rows, { onConflict: 'category_id,question_hash', ignoreDuplicates: true });
+    .upsert(rows, {
+      onConflict: 'category_id,question_hash',
+      ignoreDuplicates: true,
+    })
+    .select('id');
 
   if (error) {
-    throw error;
+    throw new Error(`Failed to insert questions: ${error.message}`);
   }
 
-  log(`Inserted batch for ${categoryName}: ${rows.length} rows`);
+  const insertedCount = data?.length ?? 0;
+  log(`Inserted ${insertedCount} of ${rows.length} questions for ${categoryName}`);
+
+  return insertedCount;
 }
 
+// ========== CATEGORY REFILL LOGIC ==========
+
+/**
+ * Executes the refill strategy for a single category:
+ * 1. Check current unplayed count
+ * 2. If below threshold, generate a batch
+ * 3. Insert and check if threshold now met
+ * 4. Continue until threshold met or stagnation detected
+ *
+ * Cooldown: After each successful batch, wait COOLDOWN_MS before checking again.
+ * This allows the Groq TPM bucket to refill and avoids hammering the API.
+ */
 async function refillCategory(row) {
   const { category_id, name } = row;
 
   let unplayed = await getUnplayedCount(category_id);
   if (unplayed >= THRESHOLD) {
+    log(`Category ${name} has ${unplayed} unplayed (>= ${THRESHOLD}), no refill needed`);
     return;
   }
 
-  log(`Category ${name} below threshold (${unplayed}/${THRESHOLD}), generating...`);
+  log(`Category ${name} below threshold: ${unplayed}/${THRESHOLD}. Starting refill...`);
 
   let stagnantBatches = 0;
+  let batchCount = 0;
 
-  // Keep generating in fixed-size batches until threshold is met.
+  // Continue generating until threshold is met
   while (unplayed < THRESHOLD) {
     const previous = unplayed;
-    const generated = await generateBatch(name);
-    await withBackoff(() => insertBatch(category_id, name, generated), {
-      label: `insert:${name}`,
-    });
-    unplayed = await getUnplayedCount(category_id);
-    log(`Category ${name} unplayed now: ${unplayed}`);
 
-    if (unplayed <= previous) {
-      stagnantBatches += 1;
-      if (stagnantBatches >= 3) {
-        fail(`Category ${name} did not grow after 3 batches; stopping to avoid infinite loop.`);
-        break;
+    try {
+      // Generate batch via multi-provider fallback with backoff on 429
+      const generated = await withBackoff(
+        () => generateQuestionsWithFallback(name),
+        { label: `generate:${name}`, retries: 5 }
+      );
+
+      // Insert batch with backoff (track which provider generated it)
+      const inserted = await withBackoff(
+        () => insertQuestionBatch(category_id, name, generated, 'multi-provider'),
+        { label: `insert:${name}`, retries: 3 }
+      );
+
+      batchCount += 1;
+      log(`${name} batch ${batchCount} complete: inserted ${inserted} questions`);
+
+      // Query updated count
+      unplayed = await getUnplayedCount(category_id);
+      log(`${name} unplayed count after batch ${batchCount}: ${unplayed}`);
+
+      // Check for stagnation (no growth)
+      if (unplayed <= previous) {
+        stagnantBatches += 1;
+        if (stagnantBatches >= 3) {
+          fail(`${name} did not grow after 3 batches. Stopping refill to avoid infinite loop.`);
+          break;
+        }
+      } else {
+        stagnantBatches = 0; // Reset counter on progress
       }
-    } else {
-      stagnantBatches = 0;
+
+      // ========== RATE-LIMIT COOLDOWN ==========
+      // After successful batch, pause before next request.
+      // This allows the Groq TPM bucket to refill and respects rate limits.
+      if (unplayed < THRESHOLD) {
+        log(`Cooling down for ${COOLDOWN_MS}ms before next batch (respecting API TPM limits)...`);
+        await sleep(COOLDOWN_MS);
+      }
+    } catch (error) {
+      fail(`${name} batch ${batchCount + 1} failed: ${error.message}`);
+      break;
     }
+  }
+
+  if (unplayed >= THRESHOLD) {
+    log(`${name} refill complete: ${unplayed} unplayed questions (>= ${THRESHOLD})`);
   }
 }
 
+// ========== MAIN CYCLE ==========
+
+/**
+ * Runs one refill cycle:
+ * 1. Query categories below threshold
+ * 2. Refill each category one at a time
+ * 3. Handle errors gracefully (log, continue to next category)
+ */
 async function runCycle() {
+  log('Starting refill cycle...');
+
+  // Query categories that need refill
   const { data, error } = await supabase.rpc('question_inventory_by_category', {
     p_threshold: THRESHOLD,
   });
 
   if (error) {
+    fail(`Failed to fetch category inventory: ${error.message}`);
     throw error;
   }
 
@@ -355,42 +753,78 @@ async function runCycle() {
     return;
   }
 
+  log(`Found ${data.length} categories below threshold`);
+
+  // Refill each category
   for (const row of data) {
     try {
       await refillCategory(row);
-    } catch (e) {
-      fail(`Refill failed for ${row.name}: ${e.message}`);
+    } catch (error) {
+      fail(`Refill failed for ${row.name}: ${error.message}`);
+      // Continue to next category instead of crashing
     }
   }
+
+  log('Cycle complete');
 }
 
+// ========== MAIN LOOP ==========
+
+/**
+ * Entry point: runs refill cycles in a continuous loop.
+ * Respects POLL_INTERVAL_MS between cycles and handles fatal errors gracefully.
+ */
 async function main() {
+  // Determine which providers are available
+  const providers = [];
+  if (GROQ_API_KEY) providers.push(`Groq(${GROQ_MODEL})`);
+  if (OPENAI_API_KEY) providers.push(`OpenAI(${OPENAI_MODEL})`);
+  if (GEMINI_API_KEY) providers.push(`Gemini(${GEMINI_MODEL})`);
+
   log(
-    `Starting AI agent with provider=${AI_PROVIDER}, threshold=${THRESHOLD}, batch=${BATCH_SIZE}, intervalMs=${POLL_INTERVAL_MS}`
+    `Starting Nebula AI Agent (Multi-Provider Fallback)\n` +
+    `  Providers: ${providers.join(' → ')}\n` +
+    `  Batch size: ${BATCH_SIZE} questions\n` +
+    `  Cooldown: ${COOLDOWN_MS}ms between batches\n` +
+    `  Threshold: ${THRESHOLD} unplayed questions\n` +
+    `  Poll interval: ${POLL_INTERVAL_MS}ms\n` +
+    `  Run once: ${RUN_ONCE}`
   );
 
   if (RUN_ONCE) {
-    await runCycle();
-    log('Run once complete');
+    try {
+      await runCycle();
+      log('Run-once mode: cycle complete, exiting');
+    } catch (error) {
+      fail(`Fatal error: ${error.message}`);
+      process.exit(1);
+    }
     return;
   }
 
+  // Continuous polling loop
+  let cycleCount = 0;
   while (true) {
     const start = Date.now();
+    cycleCount += 1;
+
     try {
+      log(`\n--- Cycle ${cycleCount} ---`);
       await runCycle();
-    } catch (e) {
-      fail(`Cycle failed: ${e.message}`);
+    } catch (error) {
+      fail(`Cycle failed: ${error.message}`);
     }
 
     const elapsed = Date.now() - start;
-    const waitMs = Math.max(1000, POLL_INTERVAL_MS - elapsed);
-    log(`Sleeping ${waitMs}ms before next cycle`);
-    await new Promise((resolve) => setTimeout(resolve, waitMs));
+    const waitMs = Math.max(5000, POLL_INTERVAL_MS - elapsed); // Never sleep less than 5s
+    log(`Cycle took ${elapsed}ms, sleeping ${waitMs}ms before next poll`);
+    await sleep(waitMs);
   }
 }
 
-main().catch((e) => {
-  fail(`Fatal error: ${e.message}`);
+// ========== ENTRY ==========
+
+main().catch((error) => {
+  fail(`Unhandled fatal error: ${error.message}`);
   process.exit(1);
 });
