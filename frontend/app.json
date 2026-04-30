@@ -19,7 +19,8 @@
       "bundleIdentifier": "com.nebula.game",
       "usesAppleSignIn": true,
       "infoPlist": {
-        "NSUserTrackingUsageDescription": "This identifier will be used to deliver personalized ads to you."
+        "NSUserTrackingUsageDescription": "This identifier will be used to deliver personalized ads to you.",
+        "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
